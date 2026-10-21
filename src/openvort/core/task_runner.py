@@ -45,6 +45,8 @@ class RunningTask:
     inject_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     cancel_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     finalize_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    finalized: asyncio.Event = field(default_factory=asyncio.Event)
+    finalization_task: asyncio.Task[bool] | None = None
     terminal_status: str | None = None
 
 
@@ -139,7 +141,8 @@ class AgentTaskRunner:
             finally:
                 # A caller cancelling this task must not interrupt terminal-state
                 # publication or leave the task visible as active.
-                await asyncio.shield(self._finalize(rt, status, summary))
+                rt.finalization_task = asyncio.create_task(self._finalize(rt, status, summary))
+                await asyncio.shield(rt.finalization_task)
 
         rt.asyncio_task = asyncio.create_task(_run())
         return task_id
@@ -190,8 +193,8 @@ class AgentTaskRunner:
 
         # Persist result
         try:
-            from openvort.web.deps import get_session_store, get_db_session_factory
             from openvort.core.services.chat_message import write_chat_message
+            from openvort.web.deps import get_db_session_factory, get_session_store
 
             session_store = get_session_store()
             sf = get_db_session_factory()
@@ -295,11 +298,12 @@ class AgentTaskRunner:
                 return False
 
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=self._cancel_grace_seconds)
+                await asyncio.wait_for(rt.finalized.wait(), timeout=self._cancel_grace_seconds)
             except asyncio.TimeoutError:
-                task.cancel()
+                if not rt.finalized.is_set():
+                    task.cancel()
                 try:
-                    await asyncio.wait_for(asyncio.shield(task), timeout=self._cancel_force_seconds)
+                    await asyncio.wait_for(rt.finalized.wait(), timeout=self._cancel_force_seconds)
                 except asyncio.TimeoutError:
                     log.error(f"Task {task_id} did not terminate after forced cancellation")
                     return False
@@ -331,6 +335,7 @@ class AgentTaskRunner:
         if self._sf:
             try:
                 from sqlalchemy import select
+
                 from openvort.db.models import AgentTask
                 async with self._sf() as db:
                     stmt = select(AgentTask).where(AgentTask.id == rt.task_id)
@@ -352,15 +357,17 @@ class AgentTaskRunner:
 
             rt.terminal_status = status
             rt.completed_at = time.time()
-            rt.done = True
 
             if status == "cancelled":
                 self._emit(rt, {"type": "interrupted", "data": "aborted"})
             elif status == "failed":
                 self._emit(rt, {"type": "server_error", "data": summary})
 
-            await self._mark_completed(rt, status, summary)
+            # Publish the complete terminal event sequence before exposing done.
+            # Database latency must not end SSE early or trigger task.cancel()
+            # while the shielded persistence operation is still running.
             self._emit(rt, {"type": "done", "data": status})
+            rt.done = True
 
             if self._session_index.get(rt.session_id) == rt.task_id:
                 self._session_index.pop(rt.session_id, None)
@@ -368,6 +375,8 @@ class AgentTaskRunner:
                 CLEANUP_DELAY,
                 lambda: self._running.pop(rt.task_id, None),
             )
+            rt.finalized.set()
+            await self._mark_completed(rt, status, summary)
             return True
 
     async def recover_on_startup(self):
@@ -375,7 +384,8 @@ class AgentTaskRunner:
         if not self._sf:
             return
         try:
-            from sqlalchemy import select, update
+            from sqlalchemy import update
+
             from openvort.db.models import AgentTask
             async with self._sf() as db:
                 stmt = (
